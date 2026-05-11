@@ -35,10 +35,8 @@ KATA_LIBEXEC_DIR="/usr/libexec/kata-containers"
 ARG_AGENT_DIR_PREFIX=""
 ARG_EXIT_IF_IMAGES_INSTALLED=""
 ARG_GENERATE_IMAGE=""
-ARG_GUEST_COMPONENTS_TARBALL="${DEFAULT_KATA_ARG_DIR}/coco-guest-components.tar.xz"
 ARG_KVERSION=`uname -r`
 ARG_OSBUILDER_DIR="${KATA_LIBEXEC_DIR}/osbuilder"
-ARG_PAUSE_IMAGE_TARBALL="${DEFAULT_KATA_ARG_DIR}/pause-bundle.tar.xz"
 ARG_REMOVE_INSTALLED_IMAGES=""
 ARG_RUNTIME_CLASS=${RUNTIME_CLASSES[0]}
 
@@ -90,18 +88,8 @@ IMAGE_TOPDIR is set to /usr/share/kata-containers, which is
 a directory persisted across boots.
 
 Options:
-  -a DIRNAME    Use the passed directory as the agent_dir prefix.  It's
-                mostly useful for pointing to an uninstalled kata-agent.
-                Default: ${ARG_AGENT_DIR_PREFIX}
-
   -c            Check if images were already generated for the current
                 kernel, and if so, simply exit
-
-  -e PATH       Pause bundle tarball compressed with xz.
-                Default: ${ARG_PAUSE_IMAGE_TARBALL}
-
-  -g PATH       Coco guest components tarball compressed with xz.
-                Default: ${ARG_GUEST_COMPONENTS_TARBALL}
 
   -h            Show this help message
 
@@ -131,13 +119,10 @@ EOT
 
 parse_args()
 {
-    while getopts "a:ce:g:hik:o:t:u" opt
+    while getopts "chik:o:t:u" opt
     do
         case $opt in
-            a) ARG_AGENT_DIR_PREFIX="${OPTARG}" ;;
             c) ARG_EXIT_IF_IMAGES_INSTALLED=1 ;;
-            e) ARG_PAUSE_IMAGE_TARBALL="${OPTARG}" ;;
-            g) ARG_GUEST_COMPONENTS_TARBALL="${OPTARG}" ;;
             h) usage 0 ;;
             i) ARG_GENERATE_IMAGE=1 ;;
             k) ARG_KVERSION="${OPTARG}" ;;
@@ -178,11 +163,9 @@ validate_runtime_class()
     if [ "${ARG_RUNTIME_CLASS}" != "${RUNTIME_CLASSES[0]}" ] ; then
         # /usr is persisted across boots and so are the pre-built initrds
         IMAGE_TOPDIR="/usr/share/kata-containers"
-
-        # kata binaries shipped in the initrd also must be pre-built
-        [ -z "${ARG_AGENT_DIR_PREFIX}" ] && die "ARG_AGENT_DIR_PREFIX empty. -a must be provided"
-        [ -e "${ARG_PAUSE_IMAGE_TARBALL}" ] || die "ARG_PAUSE_IMAGE_TARBALL invalid. -e must be provided"
-        [ -e "${ARG_GUEST_COMPONENTS_TARBALL}" ] || die "ARG_GUEST_COMPONENTS_TARBALL invalid. -g must be provided"
+        
+        # Note: kata-agent, guest-components, and pause-bundle are now installed via userdata.yaml RPMs
+        # No need to validate tarball paths
     fi
 }
 
@@ -299,44 +282,57 @@ install_trusted_ca_bundle_to_rootfs() {
 
 make_kata_adjustments_to_dracut_rootfs()
 {
-    local agent_dir="${ARG_AGENT_DIR_PREFIX}${KATA_LIBEXEC_DIR}/agent"
-    local agent_source_bin="${agent_dir}/usr/bin/kata-agent"
     local osbuilder_version="${DISTRO}-${ARG_RUNTIME_CLASS}-osbuilder-version-unknown"
     # Pre-built initrds get their agent policy rules from the location where the container file puts them.
-    # https://github.com/openshift/confidential-compute-artifacts/blob/main/containerfiles/initrd-builder/Containerfile#L89-L96
     local agent_policy_dir="${ARG_OSBUILDER_DIR}/kata-opa"
     local restricted_agent_policy="${agent_policy_dir}/restricted-policy.rego"
     local permissive_agent_policy="${agent_policy_dir}/allow-all.rego"
 
-    info "Copying agent directory tree into place"
-    \cp -ar ${agent_dir}/* ${DRACUT_ROOTFS}
-
     info "Calling osbuilder rootfs.sh on extracted rootfs"
 
     # Make kata specific adjustments
+    # Note: All components (kata-agent, guest-components, pause-bundle) are now installed via userdata.yaml RPMs
     case ${ARG_RUNTIME_CLASS} in
         "kata")
-            AGENT_SOURCE_BIN="${agent_source_bin}" \
+            AGENT_SOURCE_BIN="" \
+            RUST_AGENT="no" \
                 ./rootfs-builder/rootfs.sh \
                 -o ${osbuilder_version} \
                 -r ${DRACUT_ROOTFS}
             ;;
         "kata-cc")
-            AGENT_SOURCE_BIN="${agent_source_bin}" \
+            AGENT_SOURCE_BIN="" \
+            RUST_AGENT="no" \
             AGENT_POLICY="yes" \
             AGENT_POLICY_FILE="${restricted_agent_policy}" \
-            COCO_GUEST_COMPONENTS_TARBALL="${ARG_GUEST_COMPONENTS_TARBALL}" \
-            PAUSE_IMAGE_TARBALL="${ARG_PAUSE_IMAGE_TARBALL}" \
             CONFIDENTIAL_GUEST="yes" \
                 ${ARG_OSBUILDER_DIR}/rootfs-builder/rootfs.sh \
                 -o ${osbuilder_version} \
                 -r ${DRACUT_ROOTFS}
 
-            # Copy dynamic libraries
-            ldd ${DRACUT_ROOTFS}/usr/local/bin/api-server-rest | perl -lne 'print $1 if /=>\s+\/lib64\/(\S+)/o' | xargs -i rsync -aL /lib64/{} ${DRACUT_ROOTFS}/lib64/
-            ldd ${DRACUT_ROOTFS}/usr/local/bin/attestation-agent | perl -lne 'print $1 if /=>\s+\/lib64\/(\S+)/o' | xargs -i rsync -aL /lib64/{} ${DRACUT_ROOTFS}/lib64/
-            ldd ${DRACUT_ROOTFS}/usr/local/bin/confidential-data-hub | perl -lne 'print $1 if /=>\s+\/lib64\/(\S+)/o' | xargs -i rsync -aL /lib64/{} ${DRACUT_ROOTFS}/lib64/
-            ldd ${DRACUT_ROOTFS}/usr/bin/kata-agent | perl -lne 'print $1 if /=>\s+\/lib64\/(\S+)/o' | xargs -i rsync -aL /lib64/{} ${DRACUT_ROOTFS}/lib64/
+            # Enhanced library dependency resolution
+            local tmp_listlibs=`mktemp --tmpdir=${DRACUT_IMAGES}`
+            
+            # Find the missing libraries used by the binaries and copy them from the host
+            ldd ${DRACUT_ROOTFS}/usr/local/bin/attestation-agent | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | awk -F ":" '/.so./ {print $1}' > $tmp_listlibs
+            ldd ${DRACUT_ROOTFS}/usr/local/bin/kata-agent | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | awk -F ":" '/.so./ {print $1}' >> $tmp_listlibs
+            ldd ${DRACUT_ROOTFS}/usr/local/bin/api-server-rest | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | awk -F ":" '/.so./ {print $1}' >> $tmp_listlibs
+            ldd ${DRACUT_ROOTFS}/usr/local/bin/confidential-data-hub | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | awk -F ":" '/.so./ {print $1}' >> $tmp_listlibs
+            ldd ${DRACUT_ROOTFS}/usr/local/bin/fluent-bit | perl -lne 'print $1 if /=>\s+\/lib64\/(\S+)/o' | xargs -i rsync -aL /lib64/{} ${DRACUT_ROOTFS}/lib64/ 2>/dev/null || true
+            ldd ${DRACUT_ROOTFS}/usr/local/bin/fluent-bit | perl -lne 'print $1 if /=>\s+\/lib\/(\S+)/o' | xargs -i rsync -aL /lib/{} ${DRACUT_ROOTFS}/lib/ 2>/dev/null || true
+
+            for i in $(cat $tmp_listlibs | sort | uniq); do
+                if [ ! -e ${DRACUT_ROOTFS}${i} ]; then
+                    if [ -e /usr${i} ]; then
+                        dir=$(dirname ${i})
+                        info "Copying /usr${i}"
+                        cp -L /usr${i} ${DRACUT_ROOTFS}/usr${dir}
+                    else
+                        info "Library /usr${i} does not exist on the host."
+                    fi
+                fi
+            done
+            rm -f $tmp_listlibs
 
             info "Copy the systemd-remount-fs.service"
             cp /usr/lib/systemd/system/systemd-remount-fs.service ${DRACUT_ROOTFS}/usr/lib/systemd/system/
@@ -358,20 +354,18 @@ make_kata_adjustments_to_dracut_rootfs()
                 # Comment out the command "nvida-smi conf-compute -srs 1" as this is not CoCo.
                 sed -i '/^nvidia-smi conf-compute -srs 1/s/^/#&/' ${DRACUT_ROOTFS}/usr/lib/systemd/systemd-nvidia-cdi.sh
 
-                AGENT_SOURCE_BIN="${agent_source_bin}" \
+                AGENT_SOURCE_BIN="" \
+                RUST_AGENT="no" \
                 AGENT_POLICY="yes" \
                 AGENT_POLICY_FILE="${permissive_agent_policy}" \
-                COCO_GUEST_COMPONENTS_TARBALL="${ARG_GUEST_COMPONENTS_TARBALL}" \
-                PAUSE_IMAGE_TARBALL="${ARG_PAUSE_IMAGE_TARBALL}" \
                     ${ARG_OSBUILDER_DIR}/rootfs-builder/rootfs.sh \
                     -o ${osbuilder_version} \
                     -r ${DRACUT_ROOTFS}
             else
-                AGENT_SOURCE_BIN="${agent_source_bin}" \
+                AGENT_SOURCE_BIN="" \
+                RUST_AGENT="no" \
                 AGENT_POLICY="yes" \
                 AGENT_POLICY_FILE="${restricted_agent_policy}" \
-                COCO_GUEST_COMPONENTS_TARBALL="${ARG_GUEST_COMPONENTS_TARBALL}" \
-                PAUSE_IMAGE_TARBALL="${ARG_PAUSE_IMAGE_TARBALL}" \
                 CONFIDENTIAL_GUEST="yes" \
                     ${ARG_OSBUILDER_DIR}/rootfs-builder/rootfs.sh \
                     -o ${osbuilder_version} \
